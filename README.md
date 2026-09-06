@@ -30,29 +30,27 @@
 
 ## 下载与运行
 
-在自己管理的目录中，选择一种方式下载：
+以 root 身份在交互终端中复制以下任一命令，下载成功后会直接打开管理菜单。请在自己管理的目录中运行。
+
+使用 curl：
 
 ```sh
-curl -fL --proto '=https' --tlsv1.2 -o main.sh https://raw.githubusercontent.com/IwasakiYouko/SSHTunnel-One-Click/main/main.sh
+curl -fL --proto '=https' --tlsv1.2 -o main.sh https://raw.githubusercontent.com/IwasakiYouko/SSHTunnel-One-Click/main/main.sh && sh main.sh
 ```
+
+或使用 wget：
 
 ```sh
-wget -O main.sh https://raw.githubusercontent.com/IwasakiYouko/SSHTunnel-One-Click/main/main.sh
+wget -O main.sh https://raw.githubusercontent.com/IwasakiYouko/SSHTunnel-One-Click/main/main.sh && sh main.sh
 ```
 
-确认下载成功并检查脚本后，以 root 运行：
-
-```sh
-sh main.sh
-```
-
-使用 sudo 的系统可运行 `sudo sh main.sh`。安装后的默认管理命令为 `ssht`；若名称已被占用，脚本会要求另选名称。
+使用 sudo 的系统可先执行 `sudo -i`，再复制上面的命令。安装后的默认管理命令为 `ssht`；若名称已被占用，脚本会要求另选名称。
 
 ```sh
 ssht
 ```
 
-下载链接指向 `main` 分支当前版本，再次下载会覆盖当前目录的同名文件。请先下载再运行，菜单需要从终端读取输入，`curl | sh` 和 `wget -O- | sh` 会被拒绝。
+下载链接指向 `main` 分支当前版本，再次下载会覆盖当前目录的同名文件。命令先保存脚本，下载成功后才运行；菜单仍从终端读取输入。
 
 | 参数 | 用途 |
 | --- | --- |
