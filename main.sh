@@ -110,6 +110,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 
 
 class Path(type(NativePath())):
@@ -217,9 +218,67 @@ def run(args, check=True, capture=False, input=None):
     return p
 
 
+def paint(text, tone='normal'):
+    if tone == 'normal' or not sys.stdout.isatty() or os.environ.get('TERM', '') == 'dumb' or 'NO_COLOR' in os.environ:
+        return str(text)
+    colors = {'normal': '0', 'title': '1;36', 'muted': '90', 'accent': '36',
+              'good': '1;32', 'warning': '1;33', 'danger': '1;31'}
+    return '\033[' + colors[tone] + 'm' + str(text) + '\033[0m'
+
+
+def cell_width(text):
+    return sum(0 if unicodedata.combining(c) else
+               (2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1) for c in text)
+
+
+def ui_width():
+    return max(16, min(76, shutil.get_terminal_size((80, 24)).columns - 2))
+
+
+def ui_wrap(text, width):
+    # Count Chinese characters by terminal cells; keep long labels readable on phones.
+    for paragraph in str(text).split('\n'):
+        line, used = '', 0
+        for char in paragraph:
+            size = cell_width(char)
+            if line and used + size > width:
+                carry = ''
+                if len(line) > 1 and (char in '，。；：、！？）】》」』,.!?;:)]}' or line[-1] in '（【《「『([{'):
+                    cut = len(line) - 1
+                    while cut > 0 and unicodedata.combining(line[cut]):
+                        cut -= 1
+                    line, carry = line[:cut], line[cut:]
+                yield line.rstrip()
+                line, used = carry, cell_width(carry)
+            line += char
+            used += size
+        yield line.rstrip()
+
+
+def ui_text(text, tone='normal', indent=2):
+    for line in ui_wrap(text, max(1, ui_width() - indent)):
+        print(' ' * indent + paint(line, tone))
+
+
+def ui_rule():
+    print('  ' + paint('─' * (ui_width() - 2), 'muted'))
+
+
+def menu_banner(system_name):
+    print()
+    ui_rule()
+    ui_text('sshtunnel 一键脚本', 'title')
+    ui_text('v{}  /  {}'.format(VERSION, '轻量模式' if LIGHT else '标准模式'), 'good')
+    ui_text(system_name, 'muted')
+    ui_rule()
+    ui_text('输入编号；回车使用默认项。', 'muted')
+    ui_text('q 取消 · Ctrl+C 返回主菜单', 'muted')
+
+
 def ask(label, default=None):
-    suffix = ' [{}]'.format(default) if default is not None else ''
-    print(label + suffix + '：', end='', flush=True)
+    ui_text(label)
+    suffix = '默认 ' + paint(str(default), 'good') + '  ' if default is not None else ''
+    print('  ' + suffix + paint('> ', 'accent'), end='', flush=True)
     line = TTY.readline()
     if not line:
         raise EOFError()
@@ -245,14 +304,32 @@ def number(label, default, lo=1, hi=65535):
         print('请输入 {}～{} 的整数。'.format(lo, hi))
 
 
-def choose(label, options, default='1'):
-    print('\n' + label)
-    for key, text in sorted(options.items()):
-        print('  {}. {}'.format(key, text))
+def choose(label, options, default='1', sections=None, danger=()):
+    print()
+    ui_rule()
+    ui_text(label, 'title')
+    if sections is None:
+        keys = sorted(options, key=lambda k: (k == '0', 0 if k.isdigit() else 1,
+                                               int(k) if k.isdigit() else k))
+        sections = [('', keys)]
+    for heading, keys in sections:
+        print()
+        if heading:
+            ui_text(heading, 'muted')
+        for key in keys:
+            prefix = '  [{}]  '.format(key)
+            tone = 'danger' if key in danger else ('good' if key == default else 'accent')
+            text = options[key] + ('  (默认)' if key == default else '')
+            for i, line in enumerate(ui_wrap(text, max(1, ui_width() - len(prefix)))):
+                lead = paint(prefix, tone) if i == 0 else ' ' * len(prefix)
+                print(lead + paint(line, tone if key in danger or key == default else 'normal'))
+    print()
+    ui_rule()
     while True:
-        value = ask('选择（q 取消）', default)
+        value = ask('输入编号（q 取消）', default)
         if value in options:
             return value
+        ui_text('没有这个选项，请输入菜单中的编号。', 'warning')
 
 
 def safe_dir(path, mode=0o700):
@@ -768,10 +845,10 @@ def auth_wizard(p, work, old=None):
                 raise Error('没有有效公钥')
             credentials['public'] = '\n'.join(lines) + '\n'
         else:
-            print('\033[1;33m[私钥口令] 输入不回显；直接回车表示不加密。生成的私钥和口令会保存在 root 专用凭证库，供菜单查看。\033[0m')
+            ui_text('私钥口令：输入不回显；直接回车表示不加密。生成的私钥和口令会保存在 root 专用凭证库，供菜单查看。', 'warning')
             while True:
-                phrase = getpass.getpass('\033[1;36m设置私钥口令（可留空）：\033[0m')
-                again = getpass.getpass('\033[1;36m再次输入私钥口令：\033[0m')
+                phrase = getpass.getpass(paint('  设置私钥口令（可留空）：', 'title'))
+                again = getpass.getpass(paint('  再次输入私钥口令：', 'title'))
                 if phrase == again and len(phrase.encode('utf-8')) <= 1000 and not any(c in phrase for c in '\x00\r\n'):
                     break
                 print('两次口令须相同，不能含换行或 NUL，UTF-8 编码不得超过 1000 字节。')
@@ -1530,7 +1607,7 @@ def complete_export(p, dest):
                 atomic(dest / 'mihomo.yaml', mihomo_config(p, saved))
                 print('已生成 mihomo.yaml：将它安全下载到客户端，再导入使用 Mihomo 内核的 Clash 客户端。文件含私钥，请勿公开。')
                 if connection_host(p) == 'SERVER_IP':
-                    print('\033[1;33m未能识别服务器连接地址，请先把 mihomo.yaml 中的 SERVER_IP 改成服务器 IP 或域名。\033[0m')
+                    ui_text('未能识别服务器连接地址，请先把 mihomo.yaml 中的 SERVER_IP 改成服务器 IP 或域名。', 'warning')
         atomic(dest / 'STATUS.txt', '部署成功。\n')
         print('凭证目录：' + str(dest) + '；请安全转移到客户端，按需删除服务器副本。')
 
@@ -1623,10 +1700,10 @@ def view_users():
             print('没有保存这位用户的私钥或口令。导入公钥时私钥留在客户端，旧版本未保存的口令也无法找回。')
             print('需要新密钥时，请返回主菜单，选择“修改用户”中的登录方式。')
             return
-        print('\033[1;33m以下是登录凭证，请勿分享屏幕或把内容发到群聊。\033[0m')
+        ui_text('以下是登录凭证，请勿分享屏幕或把内容发到群聊。', 'warning')
         print(value['private'].rstrip())
         phrase = value.get('passphrase')
-        print('\033[1;36m私钥口令：\033[0m' + ('未保存，无法找回' if phrase is None else
+        print(paint('私钥口令：', 'title') + ('未保存，无法找回' if phrase is None else
               ('未设置（使用私钥时直接回车）' if phrase == '' else json.dumps(phrase, ensure_ascii=False))))
         print('这是私钥的解锁口令，不是服务器账户的登录密码；显示的外层双引号不属于口令。')
     else:
@@ -1807,11 +1884,10 @@ def main():
                     ', '.join(str(p) for p in leftovers))
     registration(Path(sys.argv[1]).absolute())
     configure_log_limits()
-    print('SSHT {} | {} | root | {}'.format(VERSION, info.get('PRETTY_NAME', OS_ID),
-                                          'OpenRC' if OS_ID == 'alpine' else 'systemd'))
-    print('q 取消当前向导；Ctrl+C 返回菜单。修改权限/认证将断开该账户现有连接。')
+    menu_banner(info.get('PRETTY_NAME', OS_ID))
+    ui_text('修改权限或登录方式会断开该账户的现有连接。', 'warning')
     if LIGHT:
-        print('轻量模式：依赖齐全时不自动更新；新配置减少待认证连接，并在未启用 fail2ban 时关闭连接日志。退出菜单后 Python 进程结束。')
+        ui_text('轻量模式：依赖齐全时跳过启动更新；未启用防爆破时关闭连接日志，退出菜单后释放管理进程。', 'muted')
     if '--no-update' not in args and ('--update' in args or not LIGHT or not core_ready()):
         try:
             update_packages()
@@ -1819,22 +1895,26 @@ def main():
             print('启动包检查未完成：{}\n仍可进入维护菜单；新增需依赖齐全。'.format(e))
     while True:
         try:
-            action = choose('主菜单', {'1': '软件包状态', '2': '刷新索引并定向安装/更新依赖',
-                '3': '新增用户', '4': '修改用户（连接、权限、密钥）',
-                '5': '删除用户', '6': '维护用户（启停、日志、解封、导出）',
-                '7': '日志占用上限（默认硬盘容量的 10%）',
-                '8': '查看用户（公钥、私钥、口令、连接方法）', '0': '退出'}, '0')
+            action = choose('sshtunnel · 主菜单', {
+                '1': '查看依赖状态', '2': '安装 / 更新依赖',
+                '3': '新增用户', '4': '修改用户 · 连接、权限',
+                '5': '删除用户', '6': '维护用户 · 启停、日志',
+                '7': '日志占用上限', '8': '查看用户 · 密钥、口令', '0': '退出'}, '0',
+                sections=[('用户管理', ('3', '8', '4', '6')),
+                          ('系统设置', ('1', '2', '7')), ('', ('5', '0'))], danger=('5',))
             if action == '0':
                 break
             {'1': package_status, '2': update_packages, '3': create_user,
              '4': modify_user, '5': delete_user, '6': maintain_user, '7': log_settings,
              '8': view_users}[action]()
         except KeyboardInterrupt:
-            print('\n已取消当前操作。')
+            print()
+            ui_text('已取消当前操作。', 'muted')
         except EOFError:
             break
         except (Error, OSError, ValueError, subprocess.SubprocessError) as e:
-            print('\n操作未完成：' + str(e))
+            print()
+            ui_text('操作未完成：' + str(e), 'warning')
         if list(ETC.glob('txn-*')):
             raise Error('仍有未恢复的事务；停止写入，请先按 README 检查恢复清单。')
 
