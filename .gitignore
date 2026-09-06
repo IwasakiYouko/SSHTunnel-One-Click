@@ -1,0 +1,6 @@
+# 只跟踪对外发布所需的文件；本地记忆、记录、测试和产物留在工作区。
+/*
+!/.gitignore
+!/main.sh
+!/README.md
+!/LICENSE
