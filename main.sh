@@ -126,7 +126,7 @@ class Path(type(NativePath())):
     def resolve(self):
         return Path(os.path.realpath(str(self)))
 
-VERSION = '1.1.0'
+VERSION = '1.2.0'
 MARKER = 'SSHT_MANAGED_SCRIPT_V1'
 ETC = Path('/etc/ssht')
 DATA = Path('/var/lib/ssht')
@@ -323,11 +323,11 @@ def package_names(with_f2b=False):
         # openrc triggers the distribution's install_if splits on newer Alpine;
         # 3.18 keeps the service script in openssh-server-common itself.
         names = ['python3', 'openssh-server', 'openssh-server-common',
-                 'openssh-keygen', 'openrc', 'shadow']
+                 'openssh-keygen', 'openrc', 'shadow', 'iptables', 'ip6tables']
         if with_f2b or pkg_installed('fail2ban'):
             names += ['fail2ban', 'iptables', 'ip6tables']
     else:
-        names = ['python3', 'openssh-server', 'openssh-client', 'passwd', 'mawk']
+        names = ['python3', 'openssh-server', 'openssh-client', 'passwd', 'mawk', 'iptables']
         if with_f2b or pkg_installed('fail2ban'):
             names += ['fail2ban', 'iptables']
     # Distribution split packages are part of the OpenSSH/Python runtime. Keep them
@@ -622,16 +622,33 @@ def ask_endpoints(label, default, required=False):
             print(e)
 
 
+def listen_addresses(address):
+    if address != 'dual':
+        return [str(ipaddress.ip_address(address))]
+    if ipv6_disabled():
+        return ['0.0.0.0']
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            sock.bind(('::', 0))
+    except OSError:
+        return ['0.0.0.0']
+    return ['0.0.0.0', '::']
+
+
 def available_port(port, address, ignore=None):
     for p in profiles():
         if p['name'] != ignore and p['port'] == port:
             raise Error('端口已被本脚本账户占用：' + p['name'])
-    family = socket.AF_INET6 if ':' in address else socket.AF_INET
-    with socket.socket(family, socket.SOCK_STREAM) as sock:
-        try:
-            sock.bind((address, port))
-        except OSError as e:
-            raise Error('端口不可监听：' + str(e)) from e
+    for addr in listen_addresses(address):
+        family = socket.AF_INET6 if ':' in addr else socket.AF_INET
+        with socket.socket(family, socket.SOCK_STREAM) as sock:
+            try:
+                if family == socket.AF_INET6:
+                    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                sock.bind((addr, port))
+            except OSError as e:
+                raise Error('端口不可监听：' + str(e)) from e
 
 
 def connection_wizard(p, old=None):
@@ -639,8 +656,12 @@ def connection_wizard(p, old=None):
     while True:
         p['port'] = number('服务器 SSH 接入端口', p.get('port', 2222), 1024)
         try:
-            addr = ask('服务器监听 IP（0.0.0.0 为全部 IPv4；:: 为 IPv6）', p.get('listen', '0.0.0.0'))
-            p['listen'] = str(ipaddress.ip_address(addr))
+            addr = ask('服务器监听地址（双栈：同时接收 IPv4/IPv6；也可填写单个 IP）',
+                       '双栈' if p.get('listen', 'dual') == 'dual' else p['listen'])
+            addr = 'dual' if addr == '双栈' else addr
+            p['listen'] = 'dual' if addr == 'dual' else str(ipaddress.ip_address(addr))
+            if addr == 'dual' and len(listen_addresses(addr)) == 1:
+                print('本机 IPv6 不可用，本次只监听全部 IPv4；启用 IPv6 后请重新应用连接配置。')
             if not old or (p['port'], p['listen']) != (old['port'], old['listen']):
                 available_port(p['port'], p['listen'], p['name'])
             break
@@ -654,7 +675,9 @@ def connection_wizard(p, old=None):
     else:
         p['socks_port'] = None
     while True:
-        host = ask('客户端连接使用的服务器域名/IP', p.get('host', 'SERVER_IP'))
+        host = ask('连接说明使用的服务器 IP/域名（全部：任一可达地址都能连接）',
+                   '全部' if p.get('host', 'any') == 'any' else p['host'])
+        host = 'any' if host == '全部' else host
         if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.:-]{0,252}', host):
             p['host'] = host
             break
@@ -662,28 +685,31 @@ def connection_wizard(p, old=None):
 
 
 def permissions_wizard(p):
-    print('\n\033[31m[必开] 使用隧道需要 SSH 认证，并且至少允许一个 TCP 转发方向。\033[0m')
-    print('账户不能使用 Shell、命令执行、SFTP/SCP、PTY、Agent/X11/Unix Socket 转发、TUN 或 sudo。')
-    print('这些权限在菜单中也不能开启，以免账户自行运行代理，绕过下面的转发限制。')
-    options = {'1': '本地/动态转发：-L / -D，SOCKS5 必开'}
+    print('\n这个账户只能建立隧道，不能登录服务器执行命令或传文件。')
+    options = {'1': '通过服务器访问网站或其他服务（常用，支持 SOCKS5）'}
     if sshd_supports('permitlisten'):
-        options.update({'2': '远程转发：-R，服务器回连客户端服务', '3': '同时允许两类'})
+        options.update({'2': '让服务器转发到客户端的服务（远程转发）', '3': '两种用途都允许'})
     else:
         print('当前 OpenSSH 不支持 PermitListen，仅开放本地/动态转发。远程转发需要 OpenSSH 7.8 或更高版本。')
     default = {'local': '1', 'remote': '2', 'yes': '3'}.get(p.get('forward'), '1')
-    mode = choose('允许哪类 TCP 转发？', options, default if default in options else '1')
+    mode = choose('这个账户用来做什么？', options, default if default in options else '1')
     p['forward'] = {'1': 'local', '2': 'remote', '3': 'yes'}[mode]
     if mode == '2' and p.get('socks_port'):
         print('仅远程转发不支持本地 SOCKS5 示例，已关闭该可选项。')
         p['socks_port'] = None
-    print('PermitOpen 限制 -L/-D 可访问的目标；any 可访问任意目标（包括服务器内网）。')
-    print('例如 example.com:443 127.0.0.1:5432。主机名按客户端填写的文本匹配，域名和对应 IP 不会自动视为相同目标。')
+    p['block_private'] = not yes('允许访问服务器内网和本机服务（不清楚请直接回车）',
+                                 not p.get('block_private', True))
+    print('访问范围：' + ('仅公网，阻止内网、本机及保留地址。' if p['block_private'] else '允许内网；不要把这个账户交给不信任的人。'))
     open_default = p.get('permit_open', 'any')
     if mode == '1' and open_default == 'none':
         open_default = 'any'
-    p['permit_open'] = ask_endpoints('允许目标', open_default, mode == '1') if mode != '2' else 'none'
+    p['permit_open'] = open_default if mode != '2' else 'none'
+    if mode != '2' and yes('另外指定能访问的网站或服务（高级设置）', False):
+        print('填主机:端口，例如 example.com:443，多项用空格隔开。any 不额外限制；上面的内网隔离仍然生效。')
+        print('域名按客户端填写的文字匹配，域名和对应 IP 不会自动视为同一个目标。')
+        p['permit_open'] = ask_endpoints('允许目标', open_default, mode == '1')
     if mode != '1':
-        print('PermitListen 限制 -R 的服务器监听地址:端口；例 localhost:8080。')
+        print('远程转发要在服务器上监听一个端口，例如 localhost:8080（只有服务器本机能连接）。')
         listen_default = p.get('permit_listen', 'localhost:8080')
         listen_required = p['permit_open'] == 'none'
         if listen_required and listen_default == 'none':
@@ -692,10 +718,13 @@ def permissions_wizard(p):
         p['gateway'] = yes('允许 -R 绑定非回环 IP、供外部主机访问', p.get('gateway', False))
     else:
         p['permit_listen'], p['gateway'] = 'none', False
-    print('启用存活探测后，服务器会定时检查连接是否还在，连续收不到回应就断开。这不会限制流量或在线时长。')
-    p['alive_interval'] = number('存活探测间隔/秒', p.get('alive_interval', 60), 0, 3600)
-    p['alive_count'] = number('连续无应答次数', p.get('alive_count', 3), 1, 100)
-    p['max_auth'] = number('单连接最多认证尝试次数', p.get('max_auth', 3), 1, 20)
+    for key, value in (('alive_interval', 60), ('alive_count', 3), ('max_auth', 3)):
+        p.setdefault(key, value)
+    if yes('调整断线检测和登录尝试次数（高级设置）', False):
+        print('定时检查连接，连续收不到回应就断开；不限制流量或正常在线时长。')
+        p['alive_interval'] = number('检查间隔/秒，0 关闭', p['alive_interval'], 0, 3600)
+        p['alive_count'] = number('连续无应答次数', p['alive_count'], 1, 100)
+        p['max_auth'] = number('单连接最多认证尝试次数', p['max_auth'], 1, 20)
 
 
 def auth_wizard(p, work, old=None):
@@ -705,13 +734,15 @@ def auth_wizard(p, work, old=None):
     p['auth'] = {'1': 'key', '2': 'password', '3': 'both'}[mode]
     credentials = {'private': None, 'public': None, 'password': None}
     if mode in ('1', '3'):
-        options = {'1': '导入客户端公钥（私钥留在客户端，推荐）', '2': '在服务器生成 Ed25519 密钥'}
+        options = {'1': '我已有密钥：导入客户端公钥（私钥留在客户端，推荐）',
+                   '2': '我还没有密钥：在服务器生成 Ed25519 密钥'}
         existing = DATA / 'authorized_keys' / p['name']
         if old and existing.exists() and existing.read_text().strip():
             options['3'] = '保留当前公钥'
-        keymode = choose('设置公钥（替换会撤销所有旧公钥）', options, '3' if '3' in options else '1')
+        keymode = choose('设置公钥（替换会撤销所有旧公钥）', options, '3' if '3' in options else '2')
         if keymode == '3':
             credentials['public'] = existing.read_text()
+            credentials['keep_private'] = True
         elif keymode == '1':
             print('可以粘贴一行标准公钥，也可以填写公钥文件的绝对路径，文件中允许有多把公钥。公钥前面不能带 authorized_keys 选项。')
             text = ask('公钥或公钥文件路径')
@@ -737,13 +768,18 @@ def auth_wizard(p, work, old=None):
                 raise Error('没有有效公钥')
             credentials['public'] = '\n'.join(lines) + '\n'
         else:
-            print('接下来由 ssh-keygen 询问私钥口令，输入时不会显示字符。口令不会写入命令参数或配置文件。')
+            print('\033[1;33m[私钥口令] 输入不回显；直接回车表示不加密。生成的私钥和口令会保存在 root 专用凭证库，供菜单查看。\033[0m')
+            while True:
+                phrase = getpass.getpass('\033[1;36m设置私钥口令（可留空）：\033[0m')
+                again = getpass.getpass('\033[1;36m再次输入私钥口令：\033[0m')
+                if phrase == again and len(phrase.encode('utf-8')) <= 1000 and not any(c in phrase for c in '\x00\r\n'):
+                    break
+                print('两次口令须相同，不能含换行或 NUL，UTF-8 编码不得超过 1000 字节。')
             key = work / 'id_ed25519'
-            # Inherit /dev/tty, not the shell heredoc used to load this program.
-            subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-a', '64', '-f', str(key),
-                            '-C', 'ssht-' + p['name']], stdin=TTY, check=True)
+            generate_key(key, p['name'], phrase)
             credentials['private'] = key.read_bytes()
             credentials['public'] = key.with_suffix('.pub').read_text()
+            credentials['passphrase'] = phrase
     if mode in ('2', '3'):
         if old and old['auth'] in ('password', 'both') and yes('保留当前密码', True):
             pass
@@ -756,6 +792,21 @@ def auth_wizard(p, work, old=None):
                     break
                 print('两次密码必须相同，至少 12 个字符，不能含换行或 NUL 字符。')
     return credentials
+
+
+def generate_key(key, name, phrase):
+    # A detached child reads the two prompts from stdin. Never pass secrets via
+    # argv/environment; remove askpass settings so a desktop helper cannot intercept.
+    env = os.environ.copy()
+    for k in ('DISPLAY', 'SSH_ASKPASS', 'SSH_ASKPASS_REQUIRE'):
+        env.pop(k, None)
+    result = subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-a', '64',
+                             '-f', str(key), '-C', 'ssht-' + name],
+                            input=(phrase + '\n' + phrase + '\n').encode('utf-8'),
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            env=env, start_new_session=True)
+    if result.returncode:
+        raise Error('密钥生成失败；未应用账户设置。')
 
 
 def f2b_wizard(p):
@@ -788,7 +839,8 @@ def render_sshd(p):
     auth = {'key': 'publickey', 'password': 'password', 'both': 'publickey,password'}[p['auth']]
     return '\n'.join([
         '# Generated by SSHT; edit via menu', 'Port ' + str(p['port']),
-        'ListenAddress ' + p['listen'], 'HostKey ' + str(ETC / 'ssh_host_ed25519_key'),
+        'AddressFamily any', *['ListenAddress ' + a for a in listen_addresses(p['listen'])],
+        'HostKey ' + str(ETC / 'ssh_host_ed25519_key'),
         'PidFile /run/ssht-' + p['name'] + '.pid', 'AllowUsers ' + p['name'],
         'PermitRootLogin no', 'StrictModes yes', 'PermitEmptyPasswords no',
         'PubkeyAuthentication ' + ('yes' if public else 'no'),
@@ -819,6 +871,147 @@ def service_file(name):
 
 def logger_script(name):
     return SCRIPT.parent / ('serve-' + name + '.sh')
+
+
+def firewall_script(name):
+    return SCRIPT.parent / ('egress-' + name + '.sh')
+
+
+def secret_path(name):
+    return ETC / 'secrets' / (name + '.json')
+
+
+def firewall_ready():
+    if not all(shutil.which(n) for n in ('iptables', 'ip6tables', 'iptables-restore', 'ip6tables-restore')):
+        update_packages()
+    # IPv6 may be administratively disabled. The generated guard repeats this
+    # check at every start, so enabling it later cannot start an unfiltered daemon.
+    for cmd in ('iptables', 'ip6tables'):
+        if cmd == 'ip6tables' and ipv6_disabled():
+            continue
+        if not shutil.which(cmd) or run([cmd, '-w', '5', '-S', 'OUTPUT'], check=False, capture=True).returncode:
+            raise Error('默认内网隔离需要 iptables/ip6tables 和容器 NET_ADMIN 权限。当前环境无法管理规则，账户未应用；请让容器提供方开放权限，或在权限菜单明确允许内网访问。')
+
+
+def ipv6_disabled():
+    root = Path('/proc/sys/net/ipv6/conf')
+    if not root.exists():
+        return True
+    flags = list(root.glob('*/disable_ipv6'))
+    return bool(flags) and all(flag.read_text().strip() == '1' for flag in flags)
+
+
+def firewall_rules(p, ipv6=False):
+    chain = 'sshto-' + p['name']
+    tag = 'ssht:{}:{}'.format(p['name'], p['uid'])
+    lines = ['*filter', ':' + chain + ' - [0:0]', '-F ' + chain,
+             '-A ' + chain + ' -m comment --comment ' + tag,
+             # Inbound SSH replies must work even when the client is on a LAN.
+             '-A ' + chain + ' -m conntrack --ctdir REPLY -j RETURN',
+             '-A ' + chain + ' -p tcp -m addrtype --dst-type LOCAL -j REJECT --reject-with tcp-reset']
+    blocked = (['2001::/23', '2001:db8::/32', '2002::/16', '3fff::/20'] if ipv6 else
+               ['0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8',
+                '169.254.0.0/16', '172.16.0.0/12', '192.0.0.0/24', '192.0.2.0/24',
+                '192.88.99.0/24', '192.168.0.0/16', '198.18.0.0/15',
+                '198.51.100.0/24', '203.0.113.0/24', '224.0.0.0/3'])
+    if ipv6:
+        # Public unicast only: this also excludes ULA, link-local, loopback,
+        # IPv4 translation prefixes and multicast. IPv4-mapped sockets use IPv4 rules.
+        lines.append('-A ' + chain + ' -p tcp ! -d 2000::/3 -j REJECT --reject-with tcp-reset')
+    lines += ['-A ' + chain + ' -p tcp -d ' + net + ' -j REJECT --reject-with tcp-reset' for net in blocked]
+    lines += ['-A ' + chain + ' -j RETURN', 'COMMIT', '']
+    return '\n'.join(lines)
+
+
+def render_firewall(p):
+    if not p.get('block_private', False):
+        return '#!/bin/sh\n# SSHT: this account explicitly permits private destinations.\nexit 0\n'
+    return '''#!/bin/sh
+# SSHT managed egress policy. Called before sshd, never a resident process.
+set -eu
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+chain={chain}
+tag={tag}
+uid={uid}
+action=${{1:-apply}}
+case "$action" in apply|remove) ;; *) exit 2 ;; esac
+policy() {{
+    tool=$1
+    "$tool" -w 5 -S OUTPUT >/dev/null
+    if "$tool" -w 5 -S "$chain" >/dev/null 2>&1; then
+        "$tool" -w 5 -C "$chain" -m comment --comment "$tag" || {{
+            echo 'SSHT: refusing a firewall chain owned by another configuration' >&2
+            exit 1
+        }}
+    elif [ "$action" = remove ]; then
+        return
+    else
+        "$tool" -w 5 -N "$chain"
+        "$tool" -w 5 -A "$chain" -m comment --comment "$tag"
+    fi
+    if [ "$action" = remove ]; then
+        for mark in "$tag" "$tag:guard"; do
+            while "$tool" -w 5 -C OUTPUT -p tcp -m owner --uid-owner "$uid" -m comment --comment "$mark" -j "$chain" 2>/dev/null; do
+                "$tool" -w 5 -D OUTPUT -p tcp -m owner --uid-owner "$uid" -m comment --comment "$mark" -j "$chain"
+            done
+        done
+        "$tool" -w 5 -F "$chain"
+        "$tool" -w 5 -X "$chain"
+        return
+    fi
+    # --noflush preserves every other chain. The replacement is one filter-table commit.
+    if [ "$tool" = iptables ]; then
+        iptables-restore --noflush <<'SSHT_IPV4'
+{v4}SSHT_IPV4
+    else
+        ip6tables-restore --noflush <<'SSHT_IPV6'
+{v6}SSHT_IPV6
+    fi
+    # Always place our check ahead of broad OUTPUT ACCEPT rules.
+    # A temporary identical jump prevents an unfiltered gap while moving it.
+    "$tool" -w 5 -I OUTPUT 1 -p tcp -m owner --uid-owner "$uid" -m comment --comment "$tag:guard" -j "$chain"
+    while "$tool" -w 5 -C OUTPUT -p tcp -m owner --uid-owner "$uid" -m comment --comment "$tag" -j "$chain" 2>/dev/null; do
+        "$tool" -w 5 -D OUTPUT -p tcp -m owner --uid-owner "$uid" -m comment --comment "$tag" -j "$chain"
+    done
+    "$tool" -w 5 -I OUTPUT 1 -p tcp -m owner --uid-owner "$uid" -m comment --comment "$tag" -j "$chain"
+    while "$tool" -w 5 -C OUTPUT -p tcp -m owner --uid-owner "$uid" -m comment --comment "$tag:guard" -j "$chain" 2>/dev/null; do
+        "$tool" -w 5 -D OUTPUT -p tcp -m owner --uid-owner "$uid" -m comment --comment "$tag:guard" -j "$chain"
+    done
+}}
+policy iptables
+ipv6_off=yes
+if [ -d /proc/sys/net/ipv6/conf ]; then
+    for flag in /proc/sys/net/ipv6/conf/*/disable_ipv6; do
+        if [ ! -f "$flag" ] || [ "$(cat "$flag")" != 1 ]; then ipv6_off=no; fi
+    done
+fi
+if [ "$ipv6_off" = no ]; then
+    policy ip6tables
+elif [ "$action" = remove ] && ip6tables -w 5 -S "$chain" >/dev/null 2>&1; then
+    policy ip6tables
+fi
+'''.format(chain='sshto-' + p['name'], tag='ssht:{}:{}'.format(p['name'], p['uid']),
+           uid=int(p['uid']), v4=firewall_rules(p), v6=firewall_rules(p, True))
+
+
+def remove_firewall(p):
+    path = firewall_script(p['name'])
+    if p.get('block_private'):
+        if not path.exists():
+            raise Error('账户防火墙脚本缺失，无法确认规则已清理；请恢复 ' + str(path) + ' 后重试。')
+        run(['/bin/sh', path, 'remove'], capture=True)
+
+
+def store_credentials(p, credentials):
+    path = secret_path(p['name'])
+    if p['auth'] == 'password' or (credentials.get('public') is not None and
+                                 not credentials.get('keep_private') and not credentials.get('private')):
+        unlink_if_exists(path)
+    elif credentials.get('private'):
+        save_json(path, {'private': credentials['private'].decode('utf-8'),
+                         'public': credentials['public'], 'passphrase': credentials.get('passphrase'),
+                         'uid': p['uid']})
 
 
 def log_budget():
@@ -870,10 +1063,11 @@ def log_settings():
     print('日志额度已更新。超额的旧日志已清空，连接不受影响。')
 
 
-def render_logger(name, quiet=False):
+def render_logger(name, quiet=False, guard=False):
+    preflight = '/bin/sh {} apply || exit $?\n'.format(shlex.quote(str(firewall_script(name)))) if guard else ''
     if quiet:
         # exec replaces the shell: no awk/FIFO/log writer in the smallest mode.
-        return '#!/bin/sh\nexec /usr/sbin/sshd -D -f {} -E /dev/null\n'.format(
+        return '#!/bin/sh\n' + preflight + 'exec /usr/sbin/sshd -D -f {} -E /dev/null\n'.format(
             shlex.quote(str(ETC / 'sshd' / (name + '.conf'))))
     clock = run(['awk', 'BEGIN { print strftime("%s") }'], capture=True, check=False)
     timestamp = '    stamp = strftime("%b %d %H:%M:%S")'
@@ -888,6 +1082,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 LC_ALL=C
 export PATH LC_ALL
 umask 077
+{preflight}
 pipe_dir=$(mktemp -d /run/ssht-{name}.XXXXXX)
 pipe=$pipe_dir/logpipe
 child=
@@ -927,7 +1122,7 @@ wait "$writer"
 exit 1
 '''.format(name=name, config=shlex.quote(str(ETC / 'sshd' / (name + '.conf'))),
            log=shlex.quote(str(LOG / (name + '.log'))),
-           limit=shlex.quote(str(ETC / 'log-limits' / name)), timestamp=timestamp)
+           limit=shlex.quote(str(ETC / 'log-limits' / name)), timestamp=timestamp, preflight=preflight)
 
 
 def render_service(name):
@@ -1054,11 +1249,22 @@ def stop_user(p):
 def wait_service(p):
     for _ in range(30):
         if active('ssht-' + p['name']):
-            host = {'0.0.0.0': '127.0.0.1', '::': '::1'}.get(p['listen'], p['listen'])
             try:
-                with socket.create_connection((host, p['port']), timeout=0.5) as conn:
-                    if conn.recv(255).startswith(b'SSH-'):
-                        return
+                for address in listen_addresses(p['listen']):
+                    host = {'0.0.0.0': '127.0.0.1', '::': '::1'}.get(address, address)
+                    if address == '::':
+                        # Some containers enable IPv6 only on their network interface.
+                        hosts = []
+                        for line in Path('/proc/net/if_inet6').read_text().splitlines():
+                            fields = line.split()
+                            ip = ipaddress.IPv6Address(int(fields[0], 16))
+                            hosts.append(str(ip) + ('%' + fields[-1] if ip.is_link_local else ''))
+                        if hosts and '::1' not in hosts:
+                            host = hosts[0]
+                    with socket.create_connection((host, p['port']), timeout=0.5) as conn:
+                        if not conn.recv(255).startswith(b'SSH-'):
+                            raise OSError('未收到 SSH 握手')
+                return
             except OSError:
                 pass
         time.sleep(0.2)
@@ -1102,6 +1308,9 @@ def apply_profile(p, credentials, old=None):
     p['light'] = p.get('light', False) or LIGHT
     # Reject unsupported permissions before making an account or changing a jail.
     render_sshd(p)
+    if p.get('block_private'):
+        firewall_ready()
+    safe_dir(ETC / 'secrets')
     if p.get('f2b'):
         if not all(pkg_installed(n) for n in (['fail2ban', 'iptables', 'ip6tables']
                                              if OS_ID == 'alpine' else ['fail2ban', 'iptables'])):
@@ -1115,7 +1324,8 @@ def apply_profile(p, credentials, old=None):
     logfile = LOG / (name + '.log')
     rotation = Path('/etc/logrotate.d') / ('ssht-' + name)
     if not old:
-        for path in (config, keys, unit, jail, logfile, DATA / 'homes' / name, rotation, profile_path(name)):
+        for path in (config, keys, unit, jail, logfile, DATA / 'homes' / name, rotation,
+                     profile_path(name), secret_path(name), firewall_script(name)):
             if path.exists() or path.is_symlink():
                 raise Error('同名资源已存在，拒绝覆盖：' + str(path))
         if OS_ID != 'alpine':
@@ -1124,7 +1334,8 @@ def apply_profile(p, credentials, old=None):
             if state and state != 'not-found':
                 raise Error('发现同名 systemd 服务，拒绝覆盖：ssht-' + name)
     txn = Transaction(name)
-    for path in (config, keys, unit, rotation, logger_script(name), profile_path(name)):
+    for path in (config, keys, unit, rotation, logger_script(name), profile_path(name),
+                 secret_path(name), firewall_script(name)):
         txn.watch(path)
     if not old:
         txn.watch(logfile)
@@ -1134,6 +1345,7 @@ def apply_profile(p, credentials, old=None):
     made_home = False
     was_active = active('ssht-' + name) if old else False
     old_shadow = None
+    guard_written = False
     try:
         if old:
             verify_owned(old)
@@ -1165,6 +1377,7 @@ def apply_profile(p, credentials, old=None):
             atomic(keys, credentials['public'], 0o644)
         elif p['auth'] == 'password':
             atomic(keys, '', 0o644)
+        store_credentials(p, credentials)
         atomic(config, render_sshd(p))
         run(['/usr/sbin/sshd', '-t', '-f', config], capture=True)
         atomic(unit, render_service(name), 0o755 if OS_ID == 'alpine' else 0o644)
@@ -1172,7 +1385,7 @@ def apply_profile(p, credentials, old=None):
             atomic(logfile, '')
         unlink_if_exists(rotation)
         configure_log_limits(name)
-        atomic(logger_script(name), render_logger(name, p.get('light') and not p.get('f2b')), 0o700)
+        atomic(logger_script(name), render_logger(name, p.get('light') and not p.get('f2b'), guard=True), 0o700)
         if p.get('f2b'):
             atomic(jail, render_jail(p), 0o644)
         elif jail.exists():
@@ -1182,6 +1395,12 @@ def apply_profile(p, credentials, old=None):
         # Validate all files before interrupting an existing tunnel or changing its password.
         if old:
             stop_user(old)
+            if old.get('block_private') and not p.get('block_private'):
+                remove_firewall(old)
+        atomic(firewall_script(name), render_firewall(p), 0o700)
+        guard_written = True
+        if p.get('block_private'):
+            run(['/bin/sh', firewall_script(name), 'apply'], capture=True)
         if credentials.get('password'):
             password_set(name, credentials['password'])
         elif p['auth'] == 'key' and old and old['auth'] != 'key':
@@ -1199,6 +1418,8 @@ def apply_profile(p, credentials, old=None):
         print('操作失败，正在恢复本次修改。')
         try:
             service('ssht-' + name, 'stop', False)
+            if guard_written:
+                remove_firewall(p)
             if made_user:
                 stop_user(p)
                 run(['userdel', name], capture=True)
@@ -1206,6 +1427,8 @@ def apply_profile(p, credentials, old=None):
             if made_home and (DATA / 'homes' / name).exists():
                 shutil.rmtree(str(DATA / 'homes' / name))
             txn.restore()
+            if old and old.get('block_private'):
+                run(['/bin/sh', firewall_script(name), 'apply'], capture=True)
             if old_shadow is not None:
                 run(['chpasswd', '-e'], input=name + ':' + old_shadow + '\n', capture=True)
             if OS_ID != 'alpine':
@@ -1223,12 +1446,29 @@ def apply_profile(p, credentials, old=None):
         raise
 
 
+def connection_host(p):
+    host = p['host']
+    if host == 'any':
+        # Reuse the address the administrator connected to; no external IP lookup.
+        parts = os.environ.get('SSH_CONNECTION', '').split()
+        host = parts[2] if len(parts) == 4 else 'SERVER_IP'
+        try:
+            host = str(ipaddress.ip_address(host))
+        except ValueError:
+            host = 'SERVER_IP'
+    return host
+
+
 def connection_text(p):
     auth = '-i ./id_ed25519 ' if p['auth'] in ('key', 'both') else ''
-    base = 'ssh -N -T -o ExitOnForwardFailure=yes -o ServerAliveInterval=60 ' + auth + '-p {} {}@{}'.format(p['port'], p['name'], p['host'])
+    host = connection_host(p)
+    base = 'ssh -N -T -o ExitOnForwardFailure=yes -o ServerAliveInterval=60 ' + auth + '-p {} {}@{}'.format(p['port'], p['name'], host)
     lines = ['账户：' + p['name'], '认证方式：' + p['auth'], '服务器主机公钥指纹：']
     lines.append(run(['ssh-keygen', '-lf', ETC / 'ssh_host_ed25519_key.pub'], capture=True).stdout.strip())
-    lines += ['SSH 接入：主机 {}，端口 {}，用户名 {}'.format(p['host'], p['port'], p['name']),
+    if p['host'] == 'any':
+        lines += ['连接地址未限定：可使用服务器任一可达 IP 或域名，脚本不限制客户端来源 IP。',
+                  '下面地址仅供示例；若显示 SERVER_IP，请换成服务器控制台提供的 IP 或域名。']
+    lines += ['SSH 接入：主机 {}，端口 {}，用户名 {}'.format(host, p['port'], p['name']),
               '客户端请使用纯隧道模式（不请求 Shell/PTY），密钥认证使用对应私钥。']
     if p['forward'] in ('local', 'yes'):
         if p.get('socks_port'):
@@ -1239,7 +1479,8 @@ def connection_text(p):
     if p['forward'] in ('remote', 'yes'):
         lines += ['远程转发模板（按 PermitListen 替换监听地址和端口）：',
                   base + ' -R localhost:8080:127.0.0.1:80']
-    lines += ['PermitOpen: ' + p['permit_open'], 'PermitListen: ' + p['permit_listen'],
+    lines += ['内网访问：' + ('禁止（同时阻止本机及保留地址）' if p.get('block_private') else '允许；仍受目标名单限制'),
+              '允许访问的目标：' + p['permit_open'], '远程监听范围：' + p['permit_listen'],
               '请先放行服务器/云安全组 TCP ' + str(p['port']) + '；脚本不自动开放防火墙。',
               'SSH 动态代理承载 TCP，不支持通用 UDP。首次连接请核对以上主机指纹。']
     return '\n'.join(lines) + '\n'
@@ -1283,8 +1524,31 @@ def complete_export(p, dest):
     print('\n' + text)
     if dest:
         atomic(dest / 'connection.txt', text)
+        if (dest / 'id_ed25519').exists() and p['auth'] == 'key' and p['forward'] in ('local', 'yes'):
+            saved = read_credentials(p)
+            if saved and saved.get('passphrase') is not None:
+                atomic(dest / 'mihomo.yaml', mihomo_config(p, saved))
+                print('已生成 mihomo.yaml：将它安全下载到客户端，再导入使用 Mihomo 内核的 Clash 客户端。文件含私钥，请勿公开。')
+                if connection_host(p) == 'SERVER_IP':
+                    print('\033[1;33m未能识别服务器连接地址，请先把 mihomo.yaml 中的 SERVER_IP 改成服务器 IP 或域名。\033[0m')
         atomic(dest / 'STATUS.txt', '部署成功。\n')
         print('凭证目录：' + str(dest) + '；请安全转移到客户端，按需删除服务器副本。')
+
+
+def mihomo_config(p, saved):
+    # JSON quoted strings are valid YAML scalars, including multiline key material.
+    quote = lambda value: json.dumps(value, ensure_ascii=False)
+    public = (ETC / 'ssh_host_ed25519_key.pub').read_text().split()
+    return '\n'.join([
+        '# 含登录私钥，请勿分享。本配置需要支持 SSH 节点的 Mihomo 内核。',
+        'mixed-port: 7890', 'allow-lan: false', 'mode: rule', 'log-level: warning',
+        'proxies:', '  - name: SSHT', '    type: ssh',
+        '    server: ' + quote(connection_host(p)), '    port: ' + str(p['port']),
+        '    username: ' + quote(p['name']), '    private-key: ' + quote(saved['private']),
+        '    private-key-passphrase: ' + quote(saved['passphrase']),
+        '    host-key:', '      - ' + quote(' '.join(public[:2])),
+        'proxy-groups:', '  - name: SSH隧道', '    type: select', '    proxies: [SSHT]',
+        'rules:', '  - MATCH,SSH隧道', ''])
 
 
 def create_user():
@@ -1293,7 +1557,7 @@ def create_user():
     prepare_sshd_runtime()
     p = {}
     while True:
-        name = ask('新增账户名（小写字母开头，最多 20 字符）')
+        name = ask('新增账户名（小写字母开头，最多 20 字符）', 'ssht')
         if valid_name(name):
             try:
                 pwd.getpwnam(name)
@@ -1304,10 +1568,13 @@ def create_user():
         print('账户名无效或已存在；不会接管已有系统账户。')
     with tempfile.TemporaryDirectory(prefix='credentials-', dir=str(ETC)) as td:
         connection_wizard(p)
-        credentials = auth_wizard(p, Path(td))
         permissions_wizard(p)
+        if p.get('block_private'):
+            firewall_ready()
+        credentials = auth_wizard(p, Path(td))
         f2b_wizard(p)
-        print('\n请核对以下设置，密码和私钥不会显示在这里：\n' + json.dumps(p, ensure_ascii=False, indent=2))
+        print('\n请核对创建内容：')
+        print(profile_summary(p))
         if not yes('确认创建', True):
             return
         dest = prepare_export(p, credentials)
@@ -1315,11 +1582,63 @@ def create_user():
         complete_export(p, dest)
 
 
+def profile_summary(p):
+    return '\n'.join([
+        '用户名：' + p['name'], '服务器端口：' + str(p['port']),
+        '监听地址：' + ('双栈（IPv6 不可用时仅 IPv4）' if p['listen'] == 'dual' else p['listen']),
+        '连接地址：' + ('服务器任一可达 IP/域名' if p.get('host') == 'any' else p.get('host', '')),
+        '登录方式：' + {'key': '密钥', 'password': '密码', 'both': '密钥和密码均需验证'}[p['auth']],
+        '用途：' + {'local': '通过服务器访问其他服务', 'remote': '转发到客户端服务', 'yes': '双向转发'}[p['forward']],
+        '服务器内网访问：' + ('禁止' if p.get('block_private') else '允许（旧账户可能尚未启用隔离）'),
+        '额外目标限制：' + {'any': '无', 'none': '禁止本地/动态转发'}.get(p['permit_open'], p['permit_open']),
+        '登录防爆破：' + ('已启用' if p.get('f2b') else '未启用')])
+
+
+def read_credentials(p):
+    path = secret_path(p['name'])
+    if not path.exists():
+        return None
+    safe_dir(path.parent)
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o600:
+        raise Error('凭证文件须归 root 所有且权限为 600，拒绝读取不安全文件。')
+    value = load_json(path)
+    public = DATA / 'authorized_keys' / p['name']
+    if value.get('uid') != p['uid'] or not public.exists() or value.get('public') != public.read_text():
+        raise Error('保存的私钥与当前账户记录不匹配；请重新设置密钥。')
+    return value
+
+
+def view_users():
+    p = select_user()
+    print(profile_summary(p))
+    mode = choose('查看账户资料', {'1': '公钥', '2': '私钥和私钥口令（敏感信息，会显示在屏幕上）',
+                                  '3': '连接方法'})
+    if mode == '1':
+        key = DATA / 'authorized_keys' / p['name']
+        print(key.read_text().strip() if key.exists() and key.read_text().strip() else '该账户未设置公钥。')
+    elif mode == '2':
+        value = read_credentials(p)
+        if value is None:
+            print('没有保存这位用户的私钥或口令。导入公钥时私钥留在客户端，旧版本未保存的口令也无法找回。')
+            print('需要新密钥时，请返回主菜单，选择“修改用户”中的登录方式。')
+            return
+        print('\033[1;33m以下是登录凭证，请勿分享屏幕或把内容发到群聊。\033[0m')
+        print(value['private'].rstrip())
+        phrase = value.get('passphrase')
+        print('\033[1;36m私钥口令：\033[0m' + ('未保存，无法找回' if phrase is None else
+              ('未设置（使用私钥时直接回车）' if phrase == '' else json.dumps(phrase, ensure_ascii=False))))
+        print('这是私钥的解锁口令，不是服务器账户的登录密码；显示的外层双引号不属于口令。')
+    else:
+        print(connection_text(p))
+
+
 def select_user(deleting=False):
     users = profiles()
     if not users:
         raise Error('尚无本脚本管理的账户。')
-    options = {str(i): '{} :{} / {} / {}'.format(p['name'], p['port'], p['auth'],
+    options = {str(i): '{} / 端口 {} / {} / {}'.format(p['name'], p['port'],
+               {'key': '密钥登录', 'password': '密码登录', 'both': '密钥加密码'}[p['auth']],
                '运行' if active('ssht-' + p['name']) else '停止') for i, p in enumerate(users, 1)}
     index = choose('选择账户', options)
     p = users[int(index) - 1]
@@ -1356,7 +1675,7 @@ def modify_user():
             permissions_wizard(p)
         if mode in ('4', '5'):
             f2b_wizard(p)
-        print(json.dumps(p, ensure_ascii=False, indent=2))
+        print(profile_summary(p))
         if not yes('确认应用并重启此账户', True):
             return
         dest = prepare_export(p, credentials)
@@ -1382,6 +1701,7 @@ def delete_user():
         run(['usermod', '-L', name], capture=True)
         stop_user(p)
     service('ssht-' + name, 'disable', False)
+    remove_firewall(p)
     jail = jail_path(name)
     if jail.exists():
         old = jail.read_bytes()
@@ -1396,7 +1716,7 @@ def delete_user():
     # Keep the JSON until last, allowing retries after partial cleanup.
     for path in (ETC / 'sshd' / (name + '.conf'), DATA / 'authorized_keys' / name,
                  service_file(name), Path('/etc/logrotate.d') / ('ssht-' + name),
-                 logger_script(name), ETC / 'log-limits' / name):
+                 logger_script(name), ETC / 'log-limits' / name, secret_path(name), firewall_script(name)):
         unlink_if_exists(path)
     if (DATA / 'homes' / name).exists():
         shutil.rmtree(str(DATA / 'homes' / name))
@@ -1415,7 +1735,7 @@ def maintain_user():
         '3': '启动并启用开机启动', '4': '重启（断开现有隧道）', '5': '查看最近日志',
         '6': '查看 fail2ban / 解封 IP', '7': '重新导出连接说明和公钥'})
     if mode == '1':
-        print(json.dumps(p, ensure_ascii=False, indent=2))
+        print(profile_summary(p))
         print(connection_text(p))
         print(service('ssht-' + p['name'], 'status', False).stdout)
     elif mode == '2':
@@ -1447,7 +1767,7 @@ def maintain_user():
     elif mode == '7':
         key = DATA / 'authorized_keys' / p['name']
         credentials = {'public': key.read_text() if key.exists() else None}
-        print('账户记录中没有保存明文密码或客户端私钥，无法从这里找回。需要更换时，请进入认证菜单重新设置。')
+        print('此处导出公钥和连接说明。已保存的私钥及口令可在主菜单“查看用户”中查看；登录密码无法从账户记录找回。')
         dest = prepare_export(p, credentials)
         complete_export(p, dest)
 
@@ -1500,13 +1820,15 @@ def main():
     while True:
         try:
             action = choose('主菜单', {'1': '软件包状态', '2': '刷新索引并定向安装/更新依赖',
-                '3': '新增 SSH 代理用户', '4': '修改代理用户配置/权限/密钥',
-                '5': '删除代理用户', '6': '账户状态/连接说明/启停/日志/解封/凭证导出',
-                '7': '日志总额度（默认硬盘容量的 10%）', '0': '退出'}, '0')
+                '3': '新增用户', '4': '修改用户（连接、权限、密钥）',
+                '5': '删除用户', '6': '维护用户（启停、日志、解封、导出）',
+                '7': '日志占用上限（默认硬盘容量的 10%）',
+                '8': '查看用户（公钥、私钥、口令、连接方法）', '0': '退出'}, '0')
             if action == '0':
                 break
             {'1': package_status, '2': update_packages, '3': create_user,
-             '4': modify_user, '5': delete_user, '6': maintain_user, '7': log_settings}[action]()
+             '4': modify_user, '5': delete_user, '6': maintain_user, '7': log_settings,
+             '8': view_users}[action]()
         except KeyboardInterrupt:
             print('\n已取消当前操作。')
         except EOFError:
